@@ -1,0 +1,77 @@
+<# 
+.SYNOPSIS
+  Raportuje status protokołów TLS dla IIS (SCHANNEL\Protocols) oraz listę dostępnych szyfrów.
+#>
+
+$Protocols = @(
+    'SSL 2.0',
+    'SSL 3.0',
+    'TLS 1.0',
+    'TLS 1.1',
+    'TLS 1.2',
+    'TLS 1.3'
+)
+
+$baseKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+
+$results = foreach ($p in $Protocols) {
+    $serverKey = Join-Path -Path (Join-Path $baseKey $p) -ChildPath 'Server'
+    $exists    = Test-Path $serverKey
+
+    if ($exists) {
+        $props = Get-ItemProperty -Path $serverKey -ErrorAction SilentlyContinue
+        $enabled = $props.Enabled
+        $disabledByDefault = $props.DisabledByDefault
+
+        # Ustalenie statusu efektywnego
+        $status =
+            if ($enabled -eq 1 -and $disabledByDefault -ne 1) { 'Enabled' }
+            elseif ($enabled -eq 0 -or $disabledByDefault -eq 1) { 'Disabled' }
+            else { 'NotConfigured' }
+
+        [pscustomobject]@{
+            Protocol            = $p
+            RegistryPath        = $serverKey
+            Enabled             = if ($null -ne $enabled) { $enabled } else { '<missing>' }
+            DisabledByDefault   = if ($null -ne $disabledByDefault) { $disabledByDefault } else { '<missing>' }
+            EffectiveStatus     = $status
+        }
+    }
+    else {
+        [pscustomobject]@{
+            Protocol            = $p
+            RegistryPath        = "$serverKey (not found)"
+            Enabled             = '<missing>'
+            DisabledByDefault   = '<missing>'
+            EffectiveStatus     = 'NotConfigured'
+        }
+    }
+}
+
+# Wydruk tabeli protokołów
+"=== Protokoły TLS/SSL (SCHANNEL\Protocols\*\Server) ==="
+$results | Sort-Object Protocol | Format-Table -AutoSize
+
+# Spróbuj pokazać listę szyfrów (działa na Windows Server 2016+)
+try {
+    "`n=== Dostępne pakiety szyfrów (cipher suites) ==="
+    Get-TlsCipherSuite | Select-Object Name, Protocol, Exchange, Cipher, Hash | Sort-Object Protocol, Name | Format-Table -AutoSize
+}
+catch {
+    Write-Warning "Cmdlet Get-TlsCipherSuite nie jest dostępny w tym systemie."
+}
+
+# Krótka podpowiedź interpretacyjna
+"`nUwaga:"
+"  - 'Enabled' = jawnie włączone w rejestrze."
+"  - 'Disabled' = jawnie wyłączone w rejestrze."
+"  - 'NotConfigured' = brak wpisów; obowiązują domyślne ustawienia systemu."
+"  - Dla IIS liczy się gałąź 'Server'."
+
+
+# Wymaga OpenSSL w PATH
+openssl s_client -connect twojserwer.domena:443 -tls1_2
+# (dla 1.0 / 1.1 / 1.3 odpowiednio: -tls1, -tls1_1, -tls1_3)
+
+
+
