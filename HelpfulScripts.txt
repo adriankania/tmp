@@ -1,77 +1,139 @@
 <# 
 .SYNOPSIS
-  Raportuje status protokołów TLS dla IIS (SCHANNEL\Protocols) oraz listę dostępnych szyfrów.
+  Audyt (i opcjonalna naprawa) ustawień protokołów SSL/TLS (Schannel) na Windows Server 2019.
+
+.EXAMPLES
+  # Sam audyt
+  .\Check-Tls.ps1
+
+  # Audyt + wyłączenie TLS 1.0 i 1.1 (Server i Client)
+  .\Check-Tls.ps1 -DisableTls10and11 -BackupRegistry
+
+  # Test połączenia HTTPS do danego hosta z wymuszeniem wersji TLS
+  .\Check-Tls.ps1 -TestHost "localhost"
 #>
 
-$Protocols = @(
-    'SSL 2.0',
-    'SSL 3.0',
-    'TLS 1.0',
-    'TLS 1.1',
-    'TLS 1.2',
-    'TLS 1.3'
+[CmdletBinding()]
+param(
+  [switch]$DisableTls10and11,
+  [switch]$BackupRegistry,
+  [string]$TestHost
 )
 
-$baseKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+$ErrorActionPreference = 'Stop'
 
-$results = foreach ($p in $Protocols) {
-    $serverKey = Join-Path -Path (Join-Path $baseKey $p) -ChildPath 'Server'
-    $exists    = Test-Path $serverKey
+# --- Ustawienia/stałe ---
+$base = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+$protocols = @(
+  'SSL 2.0',
+  'SSL 3.0',
+  'TLS 1.0',
+  'TLS 1.1',
+  'TLS 1.2',
+  'TLS 1.3'
+)
+$roles = @('Server','Client')
 
-    if ($exists) {
-        $props = Get-ItemProperty -Path $serverKey -ErrorAction SilentlyContinue
-        $enabled = $props.Enabled
-        $disabledByDefault = $props.DisabledByDefault
+function Get-SchUseState {
+  param([string]$Proto, [string]$Role)
 
-        # Ustalenie statusu efektywnego
-        $status =
-            if ($enabled -eq 1 -and $disabledByDefault -ne 1) { 'Enabled' }
-            elseif ($enabled -eq 0 -or $disabledByDefault -eq 1) { 'Disabled' }
-            else { 'NotConfigured' }
+  $path = Join-Path -Path $base -ChildPath "$Proto\$Role"
+  $exists = Test-Path $path
+  $enabled = $null
+  $disabledByDefault = $null
 
-        [pscustomobject]@{
-            Protocol            = $p
-            RegistryPath        = $serverKey
-            Enabled             = if ($null -ne $enabled) { $enabled } else { '<missing>' }
-            DisabledByDefault   = if ($null -ne $disabledByDefault) { $disabledByDefault } else { '<missing>' }
-            EffectiveStatus     = $status
-        }
+  if ($exists) {
+    $props = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+    $enabled = $props.Enabled
+    $disabledByDefault = $props.DisabledByDefault
+  }
+
+  # Interpretacja:
+  # - Enabled=1 => włączony
+  # - Enabled=0 LUB DisabledByDefault=1 => wyłączony
+  # - brak kluczy => stan domyślny OS (nie wnioskujemy tu jednoznacznie)
+  $state =
+    if ($enabled -eq 1) { 'Enabled' }
+    elseif ($enabled -eq 0 -or $disabledByDefault -eq 1) { 'Disabled' }
+    else { 'OS default' }
+
+  [pscustomobject]@{
+    Protocol          = $Proto
+    Role              = $Role
+    RegistryPath      = if ($exists) { $path } else { "$path (missing)" }
+    Enabled           = $enabled
+    DisabledByDefault = $disabledByDefault
+    EffectiveState    = $state
+  }
+}
+
+function Set-SchDisable {
+  param([string]$Proto)
+
+  foreach ($role in $roles) {
+    $p = Join-Path -Path $base -ChildPath "$Proto\$role"
+    if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+    New-ItemProperty -Path $p -Name 'Enabled' -Value 0 -PropertyType 'DWord' -Force | Out-Null
+    New-ItemProperty -Path $p -Name 'DisabledByDefault' -Value 1 -PropertyType 'DWord' -Force | Out-Null
+  }
+}
+
+function Backup-SchRegistry {
+  $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+  $file = "$env:TEMP\Schannel-Protocols-$stamp.reg"
+  & reg.exe export "HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols" $file /y | Out-Null
+  Write-Host "Kopia rejestru: $file"
+}
+
+# --- AUDYT ---
+$report = foreach ($proto in $protocols) {
+  foreach ($role in $roles) {
+    Get-SchUseState -Proto $proto -Role $role
+  }
+}
+
+# Estetyczna tabela
+$report | Sort-Object Protocol,Role | Format-Table Protocol,Role,EffectiveState,Enabled,DisabledByDefault -AutoSize
+
+# --- OPCJONALNE WYŁĄCZENIE TLS 1.0/1.1 ---
+if ($DisableTls10and11) {
+  if ($BackupRegistry) { Backup-SchRegistry }
+  'TLS 1.0','TLS 1.1' | ForEach-Object { 
+    Write-Host "Wyłączam $_ (Server/Client)..." 
+    Set-SchDisable -Proto $_ 
+  }
+  Write-Warning "Zastosowano zmiany w rejestrze. Wymagany jest RESTART serwera, aby Schannel zastosował ustawienia."
+}
+
+# --- OPCJONALNY TEST RZECZYWISTY (handshake do hosta/portu 443) ---
+if ($TestHost) {
+  Write-Host ""
+  Write-Host "Test połączeń HTTPS do $TestHost:443 z wymuszeniem wersji protokołu (klient):" -ForegroundColor Cyan
+
+  $tests = @(
+    @{ Name='SSL3';  Value=[System.Net.SecurityProtocolType]::Ssl3 },
+    @{ Name='TLS1.0';Value=[System.Net.SecurityProtocolType]::Tls },
+    @{ Name='TLS1.1';Value=[System.Net.SecurityProtocolType]::Tls11 },
+    @{ Name='TLS1.2';Value=[System.Net.SecurityProtocolType]::Tls12 }
+    # Uwaga: .NET na Windows Server 2019 nie udostępnia przełącznika TLS 1.3 w SecurityProtocolType
+  )
+
+  foreach ($t in $tests) {
+    try {
+      $orig = [System.Net.ServicePointManager]::SecurityProtocol
+      [System.Net.ServicePointManager]::SecurityProtocol = $t.Value
+      $req = [System.Net.HttpWebRequest]::Create("https://$TestHost/")
+      $req.Method = 'HEAD'
+      $req.Timeout = 5000
+      $resp = $req.GetResponse()
+      $resp.Close()
+      Write-Host ("{0,-7} : ALLOWED" -f $t.Name) -ForegroundColor Green
     }
-    else {
-        [pscustomobject]@{
-            Protocol            = $p
-            RegistryPath        = "$serverKey (not found)"
-            Enabled             = '<missing>'
-            DisabledByDefault   = '<missing>'
-            EffectiveStatus     = 'NotConfigured'
-        }
+    catch {
+      Write-Host ("{0,-7} : BLOCKED/FAILED" -f $t.Name) -ForegroundColor Yellow
     }
+    finally {
+      [System.Net.ServicePointManager]::SecurityProtocol = $orig
+    }
+  }
 }
-
-# Wydruk tabeli protokołów
-"=== Protokoły TLS/SSL (SCHANNEL\Protocols\*\Server) ==="
-$results | Sort-Object Protocol | Format-Table -AutoSize
-
-# Spróbuj pokazać listę szyfrów (działa na Windows Server 2016+)
-try {
-    "`n=== Dostępne pakiety szyfrów (cipher suites) ==="
-    Get-TlsCipherSuite | Select-Object Name, Protocol, Exchange, Cipher, Hash | Sort-Object Protocol, Name | Format-Table -AutoSize
-}
-catch {
-    Write-Warning "Cmdlet Get-TlsCipherSuite nie jest dostępny w tym systemie."
-}
-
-# Krótka podpowiedź interpretacyjna
-"`nUwaga:"
-"  - 'Enabled' = jawnie włączone w rejestrze."
-"  - 'Disabled' = jawnie wyłączone w rejestrze."
-"  - 'NotConfigured' = brak wpisów; obowiązują domyślne ustawienia systemu."
-"  - Dla IIS liczy się gałąź 'Server'."
-
-
-# Wymaga OpenSSL w PATH
-openssl s_client -connect twojserwer.domena:443 -tls1_2
-# (dla 1.0 / 1.1 / 1.3 odpowiednio: -tls1, -tls1_1, -tls1_3)
-
-
-
